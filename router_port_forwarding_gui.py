@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Router Port Forwarding GUI
+Router Port Forwarding GUI - Fixed Version
 
 A graphical user interface for managing port forwarding on routers 
 using UPnP or NAT-PMP protocols.
@@ -20,6 +20,7 @@ import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 import ipaddress
+import re
 from typing import Dict, List, Optional, Tuple, Union
 
 try:
@@ -73,42 +74,82 @@ class RouterAdmin:
             s.close()
         return local_ip
     
+    def _is_valid_ipv4(self, ip: str) -> bool:
+        """Check if a string is a valid IPv4 address"""
+        pattern = r'^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$'
+        match = re.match(pattern, ip)
+        if not match:
+            return False
+        
+        # Check that each number is between 0 and 255
+        for i in range(1, 5):
+            if int(match.group(i)) > 255:
+                return False
+                
+        return True
+    
     def _get_gateway_ip(self) -> Optional[str]:
-        """Get the gateway/router IP address"""
+        """Get the gateway/router IP address with improved parsing"""
         if sys.platform.startswith('linux'):
             try:
                 with open('/proc/net/route') as f:
                     for line in f.readlines():
                         parts = line.strip().split()
                         if parts[1] == '00000000':  # Default route
-                            return socket.inet_ntoa(bytes.fromhex(parts[2].zfill(8))[::-1])
-            except:
-                pass
+                            ip = socket.inet_ntoa(bytes.fromhex(parts[2].zfill(8))[::-1])
+                            if self._is_valid_ipv4(ip):
+                                return ip
+            except Exception as e:
+                print(f"Error getting Linux gateway: {e}")
         
         elif sys.platform == 'darwin':  # macOS
             try:
                 output = subprocess.check_output("netstat -nr | grep default", shell=True).decode('utf-8')
-                return output.split()[1]
-            except:
-                pass
+                ip = output.split()[1]
+                if self._is_valid_ipv4(ip):
+                    return ip
+            except Exception as e:
+                print(f"Error getting macOS gateway: {e}")
         
         elif sys.platform == 'win32':  # Windows
             try:
-                output = subprocess.check_output("ipconfig", shell=True).decode('utf-8')
+                # More robust parsing for Windows ipconfig output
+                output = subprocess.check_output("ipconfig", shell=True).decode('utf-8', errors='ignore')
+                
                 for line in output.split('\n'):
-                    if "Default Gateway" in line:
-                        return line.split(":")[-1].strip()
-            except:
-                pass
+                    if "Default Gateway" in line and ":" in line:
+                        gateway_str = line.split(":")[-1].strip()
+                        
+                        # Filter out invalid IPs and ensure it's in IPv4 format
+                        if gateway_str and self._is_valid_ipv4(gateway_str):
+                            return gateway_str
+                            
+                # If not found, try route print as fallback
+                output = subprocess.check_output("route print", shell=True).decode('utf-8', errors='ignore')
+                lines = output.split('\n')
+                for i, line in enumerate(lines):
+                    if "0.0.0.0" in line:
+                        parts = re.split(r'\s+', line.strip())
+                        # Try to find the gateway IP in the line
+                        for part in parts:
+                            if self._is_valid_ipv4(part) and part != "0.0.0.0" and part != "255.255.255.255":
+                                return part
+            except Exception as e:
+                print(f"Error getting Windows gateway: {e}")
                 
         # Fallback: try to guess the gateway by modifying the last octet of local IP
-        ip_parts = self.local_ip.split('.')
-        common_gateway_last_octets = ['1', '254']
-        
-        for last_octet in common_gateway_last_octets:
-            potential_gateway = f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}.{last_octet}"
-            if potential_gateway != self.local_ip:
-                return potential_gateway
+        try:    
+            ip_parts = self.local_ip.split('.')
+            if len(ip_parts) == 4:
+                common_gateway_last_octets = ['1', '254']
+                
+                for last_octet in common_gateway_last_octets:
+                    potential_gateway = f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}.{last_octet}"
+                    if potential_gateway != self.local_ip and self._is_valid_ipv4(potential_gateway):
+                        print(f"Using fallback gateway detection: {potential_gateway}")
+                        return potential_gateway
+        except Exception as e:
+            print(f"Error with fallback gateway detection: {e}")
                 
         return None
     
@@ -222,26 +263,40 @@ class RouterAdmin:
     def scan_router(self) -> None:
         """Scan router ports to identify potential admin panels"""
         if not self.gateway_ip:
-            print("Gateway IP not found.")
+            print("Gateway IP not found. Unable to scan router.")
             return
+            
+        if not self._is_valid_ipv4(self.gateway_ip):
+            print(f"Invalid gateway IP detected: {self.gateway_ip}")
+            print("Attempting to fix gateway IP detection...")
+            self.gateway_ip = self._get_gateway_ip()
+            if not self.gateway_ip or not self._is_valid_ipv4(self.gateway_ip):
+                print("Could not determine a valid gateway IP. Using fallback method...")
+                # Last resort fallback
+                ip_parts = self.local_ip.split('.')
+                self.gateway_ip = f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}.1"
+                print(f"Using fallback gateway IP: {self.gateway_ip}")
         
         common_admin_ports = [80, 443, 8080, 8443, 8081, 8888]
         
         print(f"Scanning router at {self.gateway_ip} for admin panels...")
-        nm = nmap.PortScanner()
-        nm.scan(hosts=self.gateway_ip, arguments=f'-p {",".join(map(str, common_admin_ports))}')
-        
-        if self.gateway_ip in nm.all_hosts():
-            print("\nOpen ports that might be admin panels:")
-            for port in nm[self.gateway_ip]['tcp']:
-                if nm[self.gateway_ip]['tcp'][port]['state'] == 'open':
-                    service = nm[self.gateway_ip]['tcp'][port]['name']
-                    print(f"  Port {port}/tcp is open (service: {service})")
-                    if port in [80, 443, 8080, 8443]:
-                        protocol = "https" if port in [443, 8443] else "http"
-                        print(f"  Try accessing: {protocol}://{self.gateway_ip}:{port}")
-        else:
-            print("No common admin ports found open on your router.")
+        try:
+            nm = nmap.PortScanner()
+            nm.scan(hosts=self.gateway_ip, arguments=f'-n -T4 -p {",".join(map(str, common_admin_ports))}')
+            
+            if self.gateway_ip in nm.all_hosts():
+                print("\nOpen ports that might be admin panels:")
+                for port in nm[self.gateway_ip]['tcp']:
+                    if nm[self.gateway_ip]['tcp'][port]['state'] == 'open':
+                        service = nm[self.gateway_ip]['tcp'][port]['name']
+                        print(f"  Port {port}/tcp is open (service: {service})")
+                        if port in [80, 443, 8080, 8443]:
+                            protocol = "https" if port in [443, 8443] else "http"
+                            print(f"  Try accessing: {protocol}://{self.gateway_ip}:{port}")
+            else:
+                print("No common admin ports found open on your router.")
+        except Exception as e:
+            print(f"Error scanning router: {e}")
 
     def get_system_info(self) -> str:
         """Get system information relevant to networking"""
@@ -389,6 +444,18 @@ class PortForwardingGUI:
         self.scan_btn = ttk.Button(frame_scan, text="Scan Router", command=self.scan_router)
         self.scan_btn.pack(pady=10)
         
+        # Add manual IP entry option
+        manual_frame = ttk.LabelFrame(frame_scan, text="Manual Gateway IP Entry")
+        manual_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        ttk.Label(manual_frame, text="Gateway IP:").grid(row=0, column=0, padx=5, pady=5)
+        self.manual_ip = ttk.Entry(manual_frame, width=15)
+        self.manual_ip.grid(row=0, column=1, padx=5, pady=5)
+        if self.router_admin.gateway_ip and self.router_admin._is_valid_ipv4(self.router_admin.gateway_ip):
+            self.manual_ip.insert(0, self.router_admin.gateway_ip)
+        
+        ttk.Button(manual_frame, text="Use This IP", command=self.use_manual_ip).grid(row=0, column=2, padx=5, pady=5)
+        
         # ==== System Info Tab ====
         frame_info = ttk.Frame(self.tab_system_info)
         frame_info.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
@@ -424,6 +491,21 @@ class PortForwardingGUI:
         """Update the status bar with network information"""
         status_text = f"Local IP: {self.router_admin.local_ip} | Gateway IP: {self.router_admin.gateway_ip} | UPnP: {'Initialized' if self.upnp_initialized else 'Not Initialized'}"
         self.status_bar.config(text=status_text)
+    
+    def use_manual_ip(self):
+        """Use manually entered gateway IP"""
+        ip = self.manual_ip.get().strip()
+        if not ip:
+            messagebox.showerror("Error", "Please enter a gateway IP address.")
+            return
+            
+        if not self.router_admin._is_valid_ipv4(ip):
+            messagebox.showerror("Error", "Invalid IPv4 address format.")
+            return
+            
+        self.router_admin.gateway_ip = ip
+        print(f"Now using manually specified gateway IP: {ip}")
+        self.update_status_bar()
     
     def initialize_upnp(self):
         """Initialize UPnP in a separate thread"""
